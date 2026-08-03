@@ -4,15 +4,12 @@
 
 ### The online layer for arcade games — leaderboards, ghosts, live events, and realtime races
 
-[![CI](https://github.com/PandaCatz/PandaNet-Postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/PandaCatz/PandaNet-Postgres/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen.svg)](test.js)
+[![Tests](https://img.shields.io/badge/tests-75%20passing-brightgreen.svg)](test.js)
 [![Postgres](https://img.shields.io/badge/postgres-%E2%89%A5%2013-336791.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-**Same API, same behaviour, same 72 tests — backed by PostgreSQL instead of SQLite.**
-
-Sibling of [PandaCatz/PandaNet](https://github.com/PandaCatz/PandaNet) (the zero-dependency SQLite edition).
+**Same API, same behaviour — backed by PostgreSQL instead of SQLite.**
 
 </div>
 
@@ -36,14 +33,14 @@ changed; only storage did.
 | Deploy target | VPS with persistent disk | VPS, or any PaaS with managed Postgres |
 | Concurrency | one writer | real concurrent writes |
 | Backups | `sqlite3 .backup` | `pg_dump` / provider snapshots |
-| API + tests | identical | identical (72 assertions) |
+| API + tests | identical API; 65-assertion suite | identical API; 75-assertion suite |
 
 ## Quick start
 
 ```bash
 npm install
 DATABASE_URL=postgres://user:pass@localhost:5432/pandanet npm start
-npm test          # spins up a real PostgreSQL and runs all 72 assertions
+npm test          # spins up a real PostgreSQL and runs all 75 assertions
 ```
 
 `npm test` needs no database of its own — it downloads and runs a real
@@ -55,7 +52,9 @@ existing server to use that instead (which is what CI should do).
 
 | Var | Required | Meaning |
 |---|---|---|
-| `DATABASE_URL` | **yes** | `postgres://user:pass@host:5432/db`. Append `?sslmode=require` for managed providers; the pool then connects with TLS without demanding a publicly-verifiable chain. |
+| `DATABASE_URL` | **yes** | `postgres://user:pass@host:5432/db`. For TLS see [TLS to a managed database](#tls-to-a-managed-database) — in `pg` 8.x `sslmode=require` means **full verification**, and `sslmode=no-verify` is the mode that skips chain verification. |
+| `PG_POOL_MAX` | no (10) | Connection pool size. Lower it on a small managed plan whose `max_connections` is 20–25 and shared with the provider's own tooling. |
+| `PG_QUERY_TIMEOUT_MS` | no (15000) | Client-side query deadline. Reclaims a pool slot stranded on a dead-but-open socket after a failover. |
 | `PORT` | no (8324) | HTTP + WebSocket listen port |
 | `HOST` | no (127.0.0.1) | Bind address. Loopback by default so the app sits behind a proxy; set `0.0.0.0` on a PaaS. |
 | `ADMIN_KEY` | yes | Bearer for `/api/admin/*`. Empty disables admin endpoints. |
@@ -66,6 +65,19 @@ existing server to use that instead (which is what CI should do).
 
 Run `node server.js --migrate-only` to create or update the schema and exit —
 useful as a release/deploy step. It is idempotent.
+
+### TLS to a managed database
+
+`pg` parses an `sslmode` in the connection string *after* any options the code
+sets, so the URL always wins. That makes the mode you write the only thing that
+matters:
+
+| URL | Behaviour |
+|---|---|
+| `?sslmode=no-verify` | TLS, no chain verification. **Use this** for providers with a private CA (RDS, DigitalOcean, Heroku, Aiven) unless you ship their root certificate. |
+| `?sslmode=require` | TLS with **full verification** in `pg` 8.x — fails against a private CA. |
+| `?sslmode=verify-full&sslrootcert=/path/ca.crt` | TLS, fully verified against a CA you supply. The strongest option. |
+| no `sslmode` | Falls back to whatever the code passes (none by default). |
 
 ## What changed from the SQLite edition
 
@@ -92,6 +104,16 @@ five things needed real attention:
   a timer callback where awaiting is impossible. The cache loads at boot and
   refreshes on admin write — and it also removes a database read from every
   score submission.
+- **Finishing a run is one transaction.** Closing the run and writing the score
+  are separate statements; as separate round trips they can half-succeed, which
+  burns the run — the client's retry then gets a 409 that the SDK correctly
+  reads as "already recorded", losing the score silently. On one connection
+  inside `BEGIN`/`COMMIT`, a failure rolls the run back to `open` and the retry
+  works.
+- **The all-time board needs its own index.** `DISTINCT ON (player)` over
+  `(game, player, score DESC, updated)` is a full scan plus a disk-spilling
+  sort without `scores_alltime`. That endpoint is unauthenticated, so at a few
+  hundred thousand rows one client could hold the whole connection pool.
 
 `ON CONFLICT … DO UPDATE … WHERE` — the trickiest SQL in the project — ported
 unchanged; Postgres and SQLite share that syntax.
@@ -104,10 +126,11 @@ install — it runs `npm start`. Set these and you are done:
 
 | | |
 |---|---|
-| `DATABASE_URL` | from the platform's managed database |
+| `DATABASE_URL` | from the platform's managed database. See [TLS](#tls-to-a-managed-database) — you almost certainly want `?sslmode=no-verify`, **not** `require`. |
 | **`HOST=0.0.0.0`** | **required.** The default is loopback, which is right behind a local reverse proxy but makes the app **unreachable** when the router lives outside the container — a completely silent failure. The server prints a reminder at boot when it binds loopback. |
 | `PORT` | usually injected by the platform; honoured automatically |
 | `ADMIN_KEY`, `SEED_KEY` | generate your own; `SEED_KEY` must never change once live |
+| `PG_POOL_MAX` | lower than 10 if the plan's `max_connections` is small |
 | `PROXY_KEY` | only if a platform proxy will vouch for player identity |
 
 The schema is created and updated automatically on every boot, so no release
@@ -136,7 +159,7 @@ than as a crash-loop, and sets up nightly `pg_dump` backups with rotation.
 For a managed database, skip the local install:
 
 ```bash
-MANAGED_DB='postgres://user:pass@db.example.com/pandanet?sslmode=require' \
+MANAGED_DB='postgres://user:pass@db.example.com/pandanet?sslmode=no-verify' \
   bash setup.sh api.yourdomain.tld
 ```
 
@@ -154,15 +177,11 @@ countdowns are in-memory in `mp.js`**. Two app instances means two players can
 land on different processes and never see each other. Run one instance, or
 give the relay a shared backplane first.
 
-## Security
-
-See [SECURITY.md](SECURITY.md) for the threat model, the documented accepted
-limits, and how to report a vulnerability privately.
-
 ## API and everything else
 
 Unchanged — see the [SQLite edition's README](https://github.com/PandaCatz/PandaNet#readme),
 [AGENT_HANDOFF.md](https://github.com/PandaCatz/PandaNet/blob/main/AGENT_HANDOFF.md) and
 [INTEGRATION.md](https://github.com/PandaCatz/PandaNet/blob/main/INTEGRATION.md). Every endpoint, the WebSocket
 protocol, the client SDK contract, and the anti-cheat behaviour are identical,
-which is why the same 72-assertion suite passes against both.
+which is why the behavioural assertions carry over — this edition adds
+Postgres-specific ones on top (75 here versus 65 there).

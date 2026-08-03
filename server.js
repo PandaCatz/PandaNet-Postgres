@@ -113,11 +113,16 @@ const okId = s => typeof s === 'string' && /^[\w:-]{1,64}$/.test(s);
 // event payload fails the insert (22P05). Checked structurally rather than on
 // the serialized JSON: a legitimate six-character literal backslash-u-0-0-0-0
 // serializes to the same substring and would be corrupted by a text scrub.
+// Also rejects unpaired surrogates: jsonb cannot store those either, and a
+// truncated emoji ("Frost Festival 🎉".slice(0,16)) leaves one, which would
+// otherwise be an opaque 500 rather than an explained 400. Keys are checked as
+// well as values — a NUL in a key fails the insert exactly like one in a value.
 const NUL = String.fromCharCode(0);
+const badStr = s => s.includes(NUL) || !s.isWellFormed();
 function hasNul(v) {
-  if (typeof v === 'string') return v.includes(NUL);
+  if (typeof v === 'string') return badStr(v);
   if (Array.isArray(v)) return v.some(hasNul);
-  if (v && typeof v === 'object') return Object.values(v).some(hasNul);
+  if (v && typeof v === 'object') return Object.entries(v).some(([k, x]) => badStr(k) || hasNul(x));
   return false;
 }
 
@@ -337,29 +342,36 @@ const routes = {
     if (elapsed < durMs * 0.8) flagged = true;
     if (score > cfg.capBase + rooms * cfg.capPerRoom) flagged = true;
 
-    // Atomic close: the UPDATE only matches while the run is still open, so two
-    // concurrent finishes cannot both be accepted. SQLite got this for free
-    // from its single writer; Postgres has real concurrency and needs the
-    // guard stated in the statement itself.
-    const closed = await db.runFinish(now(), score, rooms, flagged, run.id);
-    if (!closed) return [409, { error: 'run already finished' }];
+    // Decode and compress the ghost log BEFORE opening the transaction, so no
+    // CPU work happens while a connection and row locks are held.
+    let ghostLog = null;
+    if (!flagged && typeof body.log === 'string' && body.log.length) {
+      let buf; try { buf = Buffer.from(body.log, 'base64'); } catch { buf = null; }
+      if (buf && buf.length && buf.length <= MAX_LOG_BYTES) ghostLog = zlib.gzipSync(buf);
+    }
+
+    // Closing the run and recording its score are ONE transaction. As separate
+    // round trips they can half-succeed — run marked done, score write fails —
+    // which burns the run: the client's retry gets 409, the SDK reads that as
+    // "already recorded", and the score is silently lost. Atomicity against a
+    // concurrent double-finish is preserved (the UPDATE still matches only
+    // while status='open').
+    const res = await db.finishRunTx({
+      t: now(), score, rooms, flagged, id: run.id,
+      game: run.game, day: run.day, player: a.player.id, log: ghostLog,
+    });
+    if (!res.closed) return [409, { error: 'run already finished' }];
+
     let best = false, rank = null, total = null;
     if (!flagged) {
-      await db.scorePut(run.game, run.day, a.player.id, score, rooms, run.id, now());
-      const cur = await db.scoreGet(run.game, run.day, a.player.id);
+      const cur = res.cur;
       best = !!cur && cur.runId === run.id;
       // Rank the score the player actually HOLDS, not the one just submitted —
       // otherwise a run that failed to beat your own best reports a placement
       // you don't have, and can even exceed `total` ("rank 3 of 2").
+      // These only shape the response, so they stay outside the transaction.
       rank = (await db.rankDaily(run.game, run.day, cur ? cur.score : score)).n + 1;
       total = (await db.countDaily(run.game, run.day)).n;
-      // Ghost: keep the day's best input log if one was sent.
-      if (best && typeof body.log === 'string' && body.log.length) {
-        let buf; try { buf = Buffer.from(body.log, 'base64'); } catch { buf = null; }
-        if (buf && buf.length && buf.length <= MAX_LOG_BYTES) {
-          await db.ghostPut(run.game, run.day, a.player.id, score, zlib.gzipSync(buf), now());
-        }
-      }
     }
     return [200, { ok: true, flagged, best, rank, total }];
   },
@@ -435,7 +447,8 @@ const routes = {
     const game = gameId(body.game);
     if (!game) return [400, { error: 'bad game' }];
     if (!isDay(body.startDay) || !isDay(body.endDay)) return [400, { error: 'bad days' }];
-    if (hasNul(body.data)) return [400, { error: 'data contains a NUL character' }];
+    if (hasNul(body.data))
+      return [400, { error: 'data contains a character jsonb cannot store (NUL or unpaired surrogate)' }];
     await db.eventNew(game, body.startDay, body.endDay, body.data ?? {});
     return [200, { ok: true }];
   },

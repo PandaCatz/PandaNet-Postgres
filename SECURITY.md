@@ -59,7 +59,7 @@ Append `?sslmode=require` for managed providers.
 
 ## Verifying a change
 
-`node test.js` must print `72 passed, 0 failed`. The suite runs against a real
+`node test.js` must print `75 passed, 0 failed`. The suite runs against a real
 PostgreSQL — downloaded automatically, or an existing server via
 `TEST_DATABASE_URL` — and covers every rejection path, not just happy paths:
 malformed WebSocket frames, ping floods, prototype-pollution message types,

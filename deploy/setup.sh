@@ -57,9 +57,24 @@ if [ -n "$MANAGED_DB" ]; then
 else
   apt-get install -y --no-install-recommends postgresql postgresql-client
   systemctl enable --now postgresql
-  DB_PASS="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
-  # Idempotent: create the role and database only if missing, and always reset
-  # the password so a re-run cannot leave the env file holding a stale one.
+
+  # REUSE the credential the running service already holds, if there is one.
+  # Rotating unconditionally broke the live API for the ~1 minute between the
+  # ALTER ROLE here and the env file + service restart at the end — and if the
+  # script aborted anywhere in that window, the only working password was
+  # already destroyed and the API stayed down.
+  DB_PASS=''
+  if [ -f /opt/pandanet/env ]; then
+    EXISTING=$(sed -n 's|^DATABASE_URL=postgres://pandanet:\([^@]*\)@127\.0\.0\.1.*|\1|p' /opt/pandanet/env)
+    if [ -n "$EXISTING" ] && PGPASSWORD="$EXISTING" psql -h 127.0.0.1 -U pandanet -d pandanet -c 'SELECT 1' >/dev/null 2>&1; then
+      DB_PASS="$EXISTING"
+      echo "reusing the existing pandanet database password"
+    fi
+  fi
+  [ -n "$DB_PASS" ] || DB_PASS="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
+
+  # Idempotent: create the role and database only if missing. The password is
+  # set every time, but to the SAME value on a re-run, so it is a no-op.
   sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pandanet') THEN

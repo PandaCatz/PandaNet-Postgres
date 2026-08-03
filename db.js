@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS scores (
   PRIMARY KEY (game, day, player)
 );
 CREATE INDEX IF NOT EXISTS scores_board ON scores(game, day, score DESC);
+-- Serves the all-time board's DISTINCT ON (player) ... ORDER BY player, score
+-- DESC, updated. Without it that query is a full scan of every score row for
+-- the game plus a disk-spilling sort — several seconds once a game has a few
+-- hundred thousand rows — and it is reachable unauthenticated, so a single
+-- client can hold the whole connection pool and stall every other endpoint.
+CREATE INDEX IF NOT EXISTS scores_alltime ON scores(game, player, score DESC, updated ASC);
 CREATE TABLE IF NOT EXISTS ghosts (
   game    TEXT   NOT NULL,
   day     TEXT   NOT NULL,
@@ -75,16 +81,42 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_window ON events(game, "startDay", "endDay");
 `;
 
+// Shared by the standalone helpers and by the transactional finishRun below,
+// so the two can never drift apart.
+const SCORE_PUT_SQL = `INSERT INTO scores (game, day, player, score, rooms, "runId", updated)
+  VALUES ($1,$2,$3,$4,$5,$6,$7)
+  ON CONFLICT (game, day, player) DO UPDATE
+    SET score = excluded.score, rooms = excluded.rooms,
+        "runId" = excluded."runId", updated = excluded.updated
+  WHERE excluded.score > scores.score`;
+const GHOST_PUT_SQL = `INSERT INTO ghosts (game, day, player, score, log, updated)
+  VALUES ($1,$2,$3,$4,$5,$6)
+  ON CONFLICT (game, day) DO UPDATE
+    SET player = excluded.player, score = excluded.score,
+        log = excluded.log, updated = excluded.updated
+  WHERE excluded.score > ghosts.score`;
+
 function makeDb(connectionString, opts = {}) {
   const pool = new Pool({
     connectionString,
-    max: opts.max ?? 10,
+    max: +(process.env.PG_POOL_MAX || opts.max || 10),
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
-    // Managed providers usually require TLS but present a cert chain the
-    // default verifier rejects. PGSSLMODE=no-verify is the documented escape.
-    ssl: opts.ssl ?? (/[?&]sslmode=require/.test(connectionString || '')
-      ? { rejectUnauthorized: false } : undefined),
+    // A client-side deadline. Without it, a connection stalled on a
+    // dead-but-open socket (managed failover, silent network drop) is never
+    // reclaimed: the pool leaks that slot permanently and, once all of them
+    // are stranded, the process serves 500s forever without ever exiting or
+    // self-healing. On timeout pg errors the query and the pool destroys and
+    // replaces the client.
+    query_timeout: +(process.env.PG_QUERY_TIMEOUT_MS || 15_000),
+    keepAlive: true,
+    // NOTE: an sslmode in the connection string is parsed AFTER this object is
+    // merged and always wins, so anything set here is ignored whenever
+    // DATABASE_URL carries sslmode. In pg 8.x `sslmode=require` means FULL
+    // verification; `sslmode=no-verify` is the mode that skips chain
+    // verification. This option therefore applies only when the URL sets no
+    // sslmode at all. See the TLS section of the README.
+    ssl: opts.ssl,
   });
 
   // A pool error (server restart, network blip) is emitted on the pool, and an
@@ -129,17 +161,51 @@ function makeDb(connectionString, opts = {}) {
         [finishedAt, score, rooms, flagged, id]),
     runSweep: before => run(`DELETE FROM runs WHERE status='open' AND "startedAt" < $1`, [before]),
 
+    // Close the run AND record its score as ONE transaction on ONE connection.
+    // Done as separate round trips these can half-succeed: the run flips to
+    // 'done' and the score write then fails (failover, pool timeout), which
+    // burns the run permanently — the client's retry gets 409, which the SDK
+    // correctly reads as "already recorded", so the score is lost silently.
+    // Inside a transaction a failure rolls the run back to 'open' and the
+    // retry re-runs the whole submission.
+    //
+    // 409-on-retry still exists and should: if COMMIT succeeded but its ack was
+    // lost, the run really is closed and scored. What this removes is 409's
+    // second, dishonest meaning of "closed and NOT recorded".
+    async finishRunTx({ t, score, rooms, flagged, id, game, day, player, log }) {
+      const c = await pool.connect();
+      try {
+        await c.query('BEGIN');
+        const r = await c.query(
+          `UPDATE runs SET "finishedAt"=$1, score=$2, rooms=$3, flagged=$4, status='done'
+             WHERE id=$5 AND status='open' RETURNING id`,
+          [t, score, rooms, flagged, id]);
+        if (!r.rows[0]) { await c.query('ROLLBACK'); return { closed: false, cur: null }; }
+        let cur = null;
+        if (!flagged) {
+          await c.query(SCORE_PUT_SQL, [game, day, player, score, rooms, id, t]);
+          cur = (await c.query(
+            'SELECT * FROM scores WHERE game=$1 AND day=$2 AND player=$3',
+            [game, day, player])).rows[0] ?? null;
+          if (log && cur && cur.runId === id) {
+            await c.query(GHOST_PUT_SQL, [game, day, player, score, log, t]);
+          }
+        }
+        await c.query('COMMIT');
+        return { closed: true, cur };
+      } catch (e) {
+        await c.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        c.release();
+      }
+    },
+
     // --- scores
     scoreGet: (game, day, player) =>
       one('SELECT * FROM scores WHERE game = $1 AND day = $2 AND player = $3', [game, day, player]),
     scorePut: (game, day, player, score, rooms, runId, updated) =>
-      run(`INSERT INTO scores (game, day, player, score, rooms, "runId", updated)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (game, day, player) DO UPDATE
-             SET score = excluded.score, rooms = excluded.rooms,
-                 "runId" = excluded."runId", updated = excluded.updated
-           WHERE excluded.score > scores.score`,
-        [game, day, player, score, rooms, runId, updated]),
+      run(SCORE_PUT_SQL, [game, day, player, score, rooms, runId, updated]),
     boardTop: (game, day, limit) =>
       all(`SELECT s.player, p.name, s.score, s.rooms FROM scores s
            JOIN players p ON p.id = s.player
@@ -167,13 +233,7 @@ function makeDb(connectionString, opts = {}) {
       one(`SELECT g.*, p.name FROM ghosts g JOIN players p ON p.id = g.player
            WHERE g.game = $1 AND g.day = $2`, [game, day]),
     ghostPut: (game, day, player, score, log, updated) =>
-      run(`INSERT INTO ghosts (game, day, player, score, log, updated)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (game, day) DO UPDATE
-             SET player = excluded.player, score = excluded.score,
-                 log = excluded.log, updated = excluded.updated
-           WHERE excluded.score > ghosts.score`,
-        [game, day, player, score, log, updated]),
+      run(GHOST_PUT_SQL, [game, day, player, score, log, updated]),
 
     // --- events
     eventFor: (game, day) =>

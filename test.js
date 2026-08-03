@@ -541,6 +541,17 @@ async function main() {
     }, { 'X-Admin-Key': 'test-admin' });
     ok(r.status === 400, `event data containing a NUL is rejected as 400, not 500 (got ${r.status})`);
 
+    // jsonb also cannot store a NUL inside a KEY, nor an unpaired surrogate —
+    // the latter is what a naive JS truncation of an emoji leaves behind.
+    {
+      const keyNul = JSON.parse('{"bad\\u0000key":1}');
+      const truncatedEmoji = { msg: 'Frost Festival \u{1F389}'.slice(0, 16) };
+      const a1 = await post('/api/admin/event', { game: G, startDay: day, endDay: day, data: keyNul }, { 'X-Admin-Key': 'test-admin' });
+      const a2 = await post('/api/admin/event', { game: G, startDay: day, endDay: day, data: truncatedEmoji }, { 'X-Admin-Key': 'test-admin' });
+      ok(a1.status === 400 && a2.status === 400,
+        `NUL in a key and a lone surrogate are both 400, not 500 (${a1.status}, ${a2.status})`);
+    }
+
     // ---- real concurrency (the reason this edition exists) ---------------
     // Driven at the db layer: over HTTP the playerTouch row lock in auth()
     // incidentally serializes same-player requests, so an HTTP race would pass
@@ -567,6 +578,33 @@ async function main() {
       ]);
       const sRow = await cdb.scoreGet('racegame', day, pX.playerId);
       ok(sRow && sRow.score === 500, `concurrent equal-score upserts converge (score ${sRow && sRow.score})`);
+
+      // playerNew's ON CONFLICT (id) DO NOTHING. Driven at the db layer for the
+      // same reason as the two above: over HTTP the pool plus the playerTouch
+      // row lock serialize these, so an HTTP-level race passes even when the
+      // conflict clause is removed.
+      const dupId = 'dup-' + Date.now().toString(36);
+      const dupes = await Promise.allSettled([1, 2, 3].map(() =>
+        cdb.playerNew(dupId, 'sec', 'dupe', Date.now(), Date.now())));
+      ok(dupes.every(d => d.status === 'fulfilled'),
+        `concurrent inserts of one new player id do not raise duplicate-key (${dupes.map(d => d.status).join(',')})`);
+
+      // The finish transaction: a failure must leave the run RETRYABLE, not
+      // consumed. A consumed-but-unscored run answers the client's retry with
+      // 409, which the SDK reads as success — losing the score silently.
+      const txId = 'tx-' + Date.now().toString(36);
+      await cdb.runNew(txId, G, me.playerId, day, Date.now());
+      let threw = false;
+      try {
+        // rooms=NaN fails the INSERT into scores AFTER the run UPDATE has run,
+        // which is precisely the half-succeeded shape the transaction prevents.
+        await cdb.finishRunTx({ t: Date.now(), score: 10, rooms: NaN, flagged: false,
+          id: txId, game: G, day, player: me.playerId, log: null });
+      } catch { threw = true; }
+      const txRun = await cdb.runGet(txId);
+      ok(threw && txRun && txRun.status === 'open',
+        `a failed finish rolls the run back to open, so the retry still works (threw=${threw}, status=${txRun && txRun.status})`);
+
       await cdb.close();
     }
 
@@ -630,7 +668,7 @@ async function main() {
   // Floor check. CI greps this summary line, which already proves the run
   // reached the end (a thrown suite never prints it) — but not that assertions
   // still EXIST. Deleting tests would otherwise be silently green.
-  const MIN_ASSERTIONS = 72;
+  const MIN_ASSERTIONS = 75;
   if (passed + failed < MIN_ASSERTIONS) {
     console.log(`\nFAIL  only ${passed + failed} assertions ran, expected at least ${MIN_ASSERTIONS}`);
     failed++;
