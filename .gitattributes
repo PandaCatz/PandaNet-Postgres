@@ -1,0 +1,17 @@
+# Everything here is deployed to Linux. A shell script or unit file checked out
+# with CRLF endings fails on the box ("bad interpreter: /bin/bash^M"), so line
+# endings are pinned regardless of the contributor's platform or core.autocrlf.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.service   text eol=lf
+Caddyfile   text eol=lf
+*.js        text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.html      text eol=lf
+
+# Never treated as text.
+*.db        binary
+*.webp      binary
+*.png       binary

@@ -1,0 +1,22 @@
+{
+  "name": "pandanet",
+  "version": "2.0.0",
+  "description": "Online backend for browser arcade games: leaderboards, daily seeds, live events, ghost racing and realtime multiplayer. PostgreSQL edition.",
+  "license": "GPL-3.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js",
+    "migrate": "node server.js --migrate-only"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "embedded-postgres": "18.4.0-beta.17"
+  }
+}

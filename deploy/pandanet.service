@@ -1,0 +1,35 @@
+[Unit]
+Description=PandaNet game API (PostgreSQL)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pandanet
+Group=pandanet
+WorkingDirectory=/opt/pandanet
+ExecStart=/usr/bin/node /opt/pandanet/server.js
+Restart=always
+RestartSec=3
+Environment=PORT=8324
+Environment=TRUST_PROXY=1
+# DATABASE_URL, ADMIN_KEY, SEED_KEY and PROXY_KEY live here (chmod 600):
+EnvironmentFile=/opt/pandanet/env
+
+# Hardening. Unlike the SQLite edition this process writes NOTHING to disk —
+# all state lives in Postgres — so no ReadWritePaths exception is needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

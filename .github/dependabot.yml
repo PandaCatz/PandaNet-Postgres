@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # This edition has a real dependency tree (pg at runtime, embedded-postgres
+  # for tests), so npm is watched as well as the pinned Actions.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci

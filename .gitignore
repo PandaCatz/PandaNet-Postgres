@@ -1,0 +1,10 @@
+node_modules/
+.pgdata-test/
+.pgdata-mig/
+*.dump
+env
+.env
+.env.*
+*.pem
+*.key
+npm-debug.log*

@@ -1,0 +1,8 @@
+# /etc/caddy/Caddyfile — TLS is automatic (Let's Encrypt).
+# Replace api.example.com with your domain (an A record to the VPS is enough).
+# reverse_proxy passes WebSocket upgrades (/ws) through without extra config,
+# so wss:// works as soon as the domain resolves.
+api.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8324
+}

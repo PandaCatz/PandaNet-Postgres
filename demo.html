@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PandaNet demo console</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, Consolas, monospace; background: #14122b; color: #e8e4ff; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; color: #7df3ff; }
+  h2 { font-size: 1rem; color: #ff8ad8; margin: 1.2rem 0 .3rem; }
+  button { font: inherit; background: #2a2650; color: #e8e4ff; border: 1px solid #4a4390; border-radius: 6px; padding: .4rem .8rem; margin: .2rem .3rem .2rem 0; cursor: pointer; }
+  button:hover { border-color: #7df3ff; }
+  input { font: inherit; background: #1d1a3d; color: inherit; border: 1px solid #4a4390; border-radius: 6px; padding: .35rem .5rem; width: 8rem; }
+  pre { background: #0e0c20; border: 1px solid #332e63; border-radius: 8px; padding: .8rem; white-space: pre-wrap; word-break: break-all; min-height: 6rem; max-height: 20rem; overflow-y: auto; }
+</style>
+<h1>PandaNet demo console</h1>
+<p>Exercises the live API on this server. Identity is kept in memory only.</p>
+<div>
+  game <input id="game" value="pandacat">
+  name <input id="name" value="demo-cat">
+</div>
+
+<h2>HTTP API</h2>
+<div>
+  <button onclick="go(async () => PandaNet.hello(null, el('name').value))">hello (new identity)</button>
+  <button onclick="go(async () => PandaNet.daily())">daily seed</button>
+  <button onclick="go(async () => PandaNet.startRun())">start run</button>
+  <button onclick="go(fakeFinish)">finish run (simulated)</button>
+  <button onclick="go(async () => PandaNet.board({around: true}))">daily board</button>
+  <button onclick="go(async () => PandaNet.board({scope: 'alltime'}))">all-time board</button>
+  <button onclick="go(async () => PandaNet.ghost())">today's ghost</button>
+</div>
+<pre id="out">ready</pre>
+
+<h2>Realtime multiplayer</h2>
+<div>
+  <button onclick="go(mpConnect)">connect</button>
+  <button onclick="go(async () => mp?.host())">host private room</button>
+  code <input id="code" placeholder="ABCD" style="width:5rem">
+  <button onclick="go(async () => mp?.join(el('code').value || undefined))">join</button>
+  <button onclick="go(async () => mp?.ready())">ready</button>
+  <button onclick="go(async () => mp?.sendState({x: 420, y: 690, form: 'cat', score: 777}))">send state</button>
+  <button onclick="go(async () => mp?.finish(4321))">finish 4321</button>
+</div>
+<div>
+  <button onclick="go(spawnRival)">spawn rival bot (joins your room code, readies up, plays)</button>
+</div>
+<pre id="mpout">not connected</pre>
+
+<script src="/client-sdk.js"></script>
+<script>
+  const el = id => document.getElementById(id);
+  let mp = null, roomCode = null;
+  const cfg = () => PandaNet.configure(location.origin, el('game').value);
+
+  async function go(fn) {
+    cfg();
+    try {
+      const r = await fn();
+      if (r !== undefined) el('out').textContent = JSON.stringify(r, null, 1);
+    } catch (e) { el('out').textContent = 'ERROR: ' + e.message; }
+  }
+  function mpLog(tag, m) {
+    if (m.t === 'room' && m.code) { roomCode = m.code; el('code').value = m.code; }
+    el('mpout').textContent = `[${tag}] ` + JSON.stringify(m) + '\n' + el('mpout').textContent;
+  }
+  async function mpConnect() {
+    if (!PandaNet.identity) await PandaNet.hello(null, el('name').value);
+    mp = await PandaNet.connect(m => mpLog('you', m));
+    return { connected: true };
+  }
+  async function fakeFinish() {
+    el('out').textContent = 'simulating a 4.2 s run…';
+    await new Promise(r => setTimeout(r, 4300));
+    const score = 800 + Math.floor(Math.random() * 4000);
+    const log = new TextEncoder().encode(JSON.stringify([[0, 1], [120, 3], [240, 1]]));
+    return PandaNet.finishRun({ score, rooms: 1 + (score >> 11), durMs: 4200, log });
+  }
+
+  // A second, fully independent identity + socket in this same page, so one
+  // browser can demo a live race. It joins your room, readies, streams state
+  // at 10 Hz for 3 s after the start signal, then finishes.
+  async function spawnRival() {
+    // The SDK is a singleton (one identity), so the rival drives the raw protocol.
+    const hello = await (await fetch('/api/hello', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'rival-bot' }) })).json();
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(hello.secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const ts = Date.now();
+    const canon = `mp|${el('game').value}|${hello.playerId}|${ts}`;
+    const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(canon));
+    const sig = [...new Uint8Array(sigBuf)].map(b => b.toString(16).padStart(2, '0')).join('');
+    const tk = await (await fetch('/api/mp/ticket', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ game: el('game').value, playerId: hello.playerId, ts, sig }) })).json();
+    const ws = new WebSocket(location.origin.replace(/^http/, 'ws') + '/ws?ticket=' + tk.ticket);
+    const send = o => ws.readyState === 1 && ws.send(JSON.stringify(o));
+    ws.onopen = () => send(roomCode ? { t: 'join', code: roomCode } : { t: 'join' });
+    ws.onmessage = e => {
+      const m = JSON.parse(e.data);
+      mpLog('bot', m);
+      if (m.t === 'room') setTimeout(() => send({ t: 'ready' }), 400);
+      // Re-ready after a race so the rematch path is actually demonstrable.
+      if (m.t === 'result') setTimeout(() => send({ t: 'ready' }), 600);
+      if (m.t === 'start') {
+        let n = 0;
+        const iv = setInterval(() => {
+          send({ t: 'state', d: { x: 100 + n * 30, y: 690, form: n % 2 ? 'panda' : 'cat', score: n * 111 } });
+          if (++n >= 30) { clearInterval(iv); send({ t: 'finish', score: n * 111 }); }
+        }, 100);
+      }
+    };
+    return { rival: hello.name };
+  }
+</script>

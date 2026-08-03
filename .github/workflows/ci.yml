@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: syntax + end-to-end suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # A real PostgreSQL, so CI exercises the same engine production does.
+    # The suite uses this instead of downloading embedded-postgres when
+    # TEST_DATABASE_URL is set.
+    services:
+      postgres:
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+        env:
+          POSTGRES_USER: pandanet
+          POSTGRES_PASSWORD: pandanet
+          POSTGRES_DB: pandanet_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pandanet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://pandanet:pandanet@127.0.0.1:5432/pandanet_test
+
+    steps:
+      # Actions are pinned to commit SHAs, not tags — a tag can be moved to
+      # point at different code after review.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install (locked, production + dev)
+        run: npm ci --no-fund --no-audit
+
+      - name: Syntax check
+        run: |
+          for f in server.js db.js mp.js client-sdk.js test.js; do node --check "$f"; done
+          for s in deploy/*.sh; do bash -n "$s"; done
+
+      - name: Schema migration is idempotent
+        run: |
+          DATABASE_URL="$TEST_DATABASE_URL" node server.js --migrate-only
+          DATABASE_URL="$TEST_DATABASE_URL" node server.js --migrate-only
+
+      # The suite asserts its own total, so a silently truncated run (an early
+      # return, a crashed server) cannot pass as green.
+      - name: End-to-end suite
+        run: node test.js | tee /tmp/out.txt && grep -q "65 passed, 0 failed" /tmp/out.txt
+
+  audit:
+    name: dependency audit + no committed secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+
+      # This edition has a real dependency tree, so it gets a real audit.
+      - name: npm audit (fail on high or critical)
+        run: npm audit --audit-level=high
+
+      - name: Scan tracked files
+        run: |
+          set -e
+          if git ls-files | grep -qE '\.(db|db-wal|db-shm|dump|pem|key)$|(^|/)\.?env$'; then
+            echo "::error::a database, dump, key, or env file is tracked"; exit 1
+          fi
+          if git grep -nIE 'gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' -- . ':!.github/*'; then
+            echo "::error::possible credential committed"; exit 1
+          fi
+          # A connection string with a real password. Shell interpolations
+          # (${VAR}) and loopback dev credentials are not secrets, so they are
+          # excluded rather than allowlisted one by one.
+          if git grep -hoIE 'postgres://[^:/@ ]+:[^@$ {}/"'"'"']{6,}@[^ "'"'"'/]+' -- . ':!*.md' ':!.github/*' \
+             | grep -vE '@(127\.0\.0\.1|localhost)'; then
+            echo "::error::a connection string with a non-local password is committed"; exit 1
+          fi
+          echo "clean"
