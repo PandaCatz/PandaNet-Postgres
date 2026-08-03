@@ -65,10 +65,13 @@ jobs:
           DATABASE_URL="$TEST_DATABASE_URL" node server.js --migrate-only
           DATABASE_URL="$TEST_DATABASE_URL" node server.js --migrate-only
 
-      # The suite asserts its own total, so a silently truncated run (an early
-      # return, a crashed server) cannot pass as green.
+      # The summary line is only printed when the suite reaches the end — a
+      # crash or early return prints nothing and fails this grep. The suite
+      # separately enforces its own MIN_ASSERTIONS floor, so deleting tests
+      # cannot pass either. That pair makes pinning an exact count here
+      # unnecessary (and stops CI breaking every time a test is added).
       - name: End-to-end suite
-        run: node test.js | tee /tmp/out.txt && grep -q "65 passed, 0 failed" /tmp/out.txt
+        run: node test.js | tee /tmp/out.txt && grep -qE "^[0-9]+ passed, 0 failed$" /tmp/out.txt
 
   audit:
     name: dependency audit + no committed secrets

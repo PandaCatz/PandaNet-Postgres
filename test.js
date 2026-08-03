@@ -11,7 +11,7 @@ const path = require('node:path');
 
 const PORT = 8399;
 const PGPORT = 55433;
-const PGDIR = path.join(__dirname, '.pgdata-test');
+let PGDIR = path.join(__dirname, '.pgdata-test');   // per-run suffix added at startup
 const DATABASE_URL = `postgres://postgres:postgres@127.0.0.1:${PGPORT}/pandanet_test`;
 const BASE = `http://127.0.0.1:${PORT}`;
 const WS = `ws://127.0.0.1:${PORT}`;
@@ -122,6 +122,13 @@ let pg = null, pgAdmin = null, srv = null;
 // point at an existing server instead (that is what CI does).
 async function startPostgres() {
   if (process.env.TEST_DATABASE_URL) {
+    // This function DROPs the schema. Refuse to do that to a database whose
+    // name does not announce itself as scratch — a TEST_DATABASE_URL pasted
+    // from a staging env file would otherwise be destroyed as step one.
+    const dbName = new URL(process.env.TEST_DATABASE_URL).pathname.replace(/^\//, '');
+    if (!/test/i.test(dbName)) {
+      throw new Error(`refusing to DROP SCHEMA on database "${dbName}" — its name must contain "test"`);
+    }
     const { Client } = require('pg');
     pgAdmin = new Client({ connectionString: process.env.TEST_DATABASE_URL });
     await pgAdmin.connect();
@@ -130,7 +137,16 @@ async function startPostgres() {
     return process.env.TEST_DATABASE_URL;
   }
   const { default: EmbeddedPostgres } = await import('embedded-postgres');
-  fs.rmSync(PGDIR, { recursive: true, force: true });
+  // A per-run directory. Reusing one fixed path means a postgres left running
+  // by an interrupted earlier run holds a lock on it, and the startup rmSync
+  // dies with EBUSY before a single test executes. Stale dirs are swept
+  // best-effort — one still locked must not fail the run.
+  for (const name of fs.readdirSync(__dirname)) {
+    if (name.startsWith('.pgdata-test')) {
+      try { fs.rmSync(path.join(__dirname, name), { recursive: true, force: true }); } catch {}
+    }
+  }
+  PGDIR = path.join(__dirname, `.pgdata-test-${process.pid}`);
   pg = new EmbeddedPostgres({
     databaseDir: PGDIR, user: 'postgres', password: 'postgres',
     port: PGPORT, persistent: false,
@@ -153,7 +169,9 @@ async function stopPostgres() {
 async function main() {
   const url = await startPostgres();
   srv = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), DATABASE_URL: url, ADMIN_KEY: 'test-admin', SEED_KEY: 'test-seed', PROXY_KEY: 'test-proxy' },
+    // The whole suite drives one IP, so the production 60/min bucket would
+    // throttle the tail of the run and report the 429s as unrelated failures.
+    env: { ...process.env, PORT: String(PORT), DATABASE_URL: url, ADMIN_KEY: 'test-admin', SEED_KEY: 'test-seed', PROXY_KEY: 'test-proxy', RATE_PER_MIN: '100000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   srv.stderr.on('data', d => { const s = String(d); if (!s.includes('ExperimentalWarning') && !s.includes('trace-warnings')) process.stderr.write(s); });
@@ -284,7 +302,10 @@ async function main() {
     r = await get(`/api/board?game=${G}`);
     ok(r.body.top[0].name === 'Platform Cat', 'platform player on the board');
     r = await post('/api/run/start', { game: G }, { ...prox, 'X-Proxy-Key': 'wrong' });
-    ok(r.status === 403, 'bad proxy key rejected');
+    // Assert the REASON, not just the status: an unauthenticated request also
+    // returns 403, so a status-only check passes even if the reject branch is
+    // deleted and the request silently falls through to direct mode.
+    ok(r.status === 403 && r.body.error === 'bad proxy key', 'bad proxy key rejected as such');
 
     // --- realtime multiplayer: two sockets, one private room, full race
     const a = wsClient(await wsTicket(me, G));
@@ -481,14 +502,139 @@ async function main() {
       x1.close(); x2.close();
     }
 
+    // ---- postgres-port regressions ---------------------------------------
+    // A NUL byte in any id reaches a TEXT parameter, which Postgres rejects
+    // (22021). These must stay clean misses, not 500s with a driver error.
+    {
+      const NUL = String.fromCharCode(0);
+      const bad = [];
+      const probe = async (label, want, fn) => {
+        const res = await fn();
+        if (res.status !== want) bad.push(`${label}=${res.status}(want ${want})`);
+        return res;
+      };
+      const bo = await probe('board', 200, () =>
+        get(`/api/board?game=${G}&around=${encodeURIComponent(NUL + 'x')}`));
+      if (bo.body && bo.body.me) bad.push('board returned me for a NUL id');
+      await probe('hello', 403, () => post('/api/hello', { playerId: NUL + 'a', secret: 'b' }));
+      await probe('finish', 404, () => {
+        const ts = Date.now();
+        return post('/api/run/finish', {
+          playerId: me.playerId, runId: NUL + 'r', score: 10, rooms: 1, durMs: 450, ts,
+          sig: hmac(me.secret, `finish|${NUL}r|10|1|${ts}`),
+        });
+      });
+      await probe('start', 403, () => {
+        const ts = Date.now();
+        return post('/api/run/start', { game: G, playerId: NUL + 'p', ts, sig: 'x'.repeat(64) });
+      });
+      ok(bad.length === 0, `NUL bytes in ids stay clean 403/404/200, not 500${bad.length ? ' — ' + bad.join('; ') : ''}`);
+    }
+
+    // jsonb cannot hold U+0000 even as an escape, so this insert would 500.
+    // (The guard walks the object structurally rather than scrubbing the
+    // serialized JSON, which would also corrupt a legitimate literal
+    // backslash-u-0000 string — that distinction is covered by code review,
+    // not here, because shell/editor escaping makes it a brittle assertion.)
+    r = await post('/api/admin/event', {
+      game: G, startDay: day, endDay: day, data: { s: 'a' + String.fromCharCode(0) + 'b' },
+    }, { 'X-Admin-Key': 'test-admin' });
+    ok(r.status === 400, `event data containing a NUL is rejected as 400, not 500 (got ${r.status})`);
+
+    // ---- real concurrency (the reason this edition exists) ---------------
+    // Driven at the db layer: over HTTP the playerTouch row lock in auth()
+    // incidentally serializes same-player requests, so an HTTP race would pass
+    // even with the atomic guard removed.
+    {
+      const { makeDb } = require('./db');
+      const cdb = makeDb(url);
+      const rid2 = 'race-' + Date.now().toString(36);
+      await cdb.runNew(rid2, G, me.playerId, day, Date.now());
+      const both = await Promise.all([
+        cdb.runFinish(Date.now(), 1000, 2, false, rid2),
+        cdb.runFinish(Date.now(), 999999, 99, false, rid2),
+      ]);
+      const winners = both.filter(Boolean).length;
+      const row = await cdb.runGet(rid2);
+      ok(winners === 1 && row.status === 'done',
+        `concurrent double-finish: exactly one wins (${winners} accepted, score ${row.score})`);
+
+      // Two identical-score upserts must not both "win" the conflict clause.
+      const pX = (await post('/api/hello', { name: 'racer' })).body;
+      await Promise.all([
+        cdb.scorePut('racegame', day, pX.playerId, 500, 3, 'r-a', Date.now()),
+        cdb.scorePut('racegame', day, pX.playerId, 500, 7, 'r-b', Date.now()),
+      ]);
+      const sRow = await cdb.scoreGet('racegame', day, pX.playerId);
+      ok(sRow && sRow.score === 500, `concurrent equal-score upserts converge (score ${sRow && sRow.score})`);
+      await cdb.close();
+    }
+
+    // Concurrent first contact for one NEW proxy player: without the
+    // ON CONFLICT DO NOTHING in playerNew, one of these is a duplicate-key 500.
+    {
+      const p = { 'X-Proxy-Key': 'test-proxy', 'X-Player-Id': 'tt:race-new', 'X-Player-Name': 'Racer' };
+      const rs = await Promise.all([1, 2, 3].map(() => post('/api/hello', {}, p)));
+      ok(rs.every(x => x.status === 200), `concurrent first contact for one proxy player does not race (${rs.map(x => x.status).join(',')})`);
+    }
+
+    // ---- all-time board: DISTINCT ON must pair `rooms` with the max score --
+    // Needs two days of scores for one player, which nothing else creates.
+    {
+      const ap = (await post('/api/hello', { name: 'alltimer' })).body;
+      await post('/api/admin/game', { game: 'atgame', cfg: { minMs: 300 } }, { 'X-Admin-Key': 'test-admin' });
+      await playRun(ap, 'atgame', 100, 1);                       // low score, rooms 1
+      const yest = new Date(Date.now() - 26 * 3600e3).toISOString().slice(0, 10);
+      await pgAdmin.query('UPDATE scores SET day = $1 WHERE game = $2 AND player = $3', [yest, 'atgame', ap.playerId]);
+      await playRun(ap, 'atgame', 9000, 9);                      // high score, rooms 9
+      r = await get('/api/board?game=atgame&scope=alltime');
+      ok(r.body.top.length === 1 && r.body.top[0].score === 9000 && r.body.top[0].rooms === 9,
+        `all-time board keeps rooms from the row owning the max score (score ${r.body.top[0] && r.body.top[0].score}, rooms ${r.body.top[0] && r.body.top[0].rooms})`);
+    }
+
+    // The suite runs with the limiter effectively disabled, which would hide a
+    // broken limiter entirely. Prove it still works with a second server whose
+    // budget is tiny.
+    {
+      const rlPort = PORT + 3;
+      const rl = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+        env: { ...process.env, PORT: String(rlPort), DATABASE_URL: url, ADMIN_KEY: 'x', SEED_KEY: 'y', RATE_PER_MIN: '3' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      await new Promise((res, rej) => {
+        rl.stdout.on('data', d => { if (String(d).includes('listening')) res(); });
+        setTimeout(() => rej(new Error('rate-limit server never came up')), 20000);
+      });
+      let throttled = 0;
+      for (let i = 0; i < 12; i++) {
+        const rr = await fetch(`http://127.0.0.1:${rlPort}/api/health`);
+        if (rr.status === 429) throttled++;
+      }
+      rl.kill();
+      ok(throttled > 0, `rate limiter still enforces its budget (${throttled}/12 requests throttled at RATE_PER_MIN=3)`);
+    }
+
     // --- health
     r = await get('/api/health');
-    ok(r.body.ok === true && r.body.games >= 2, `health: ${r.body.players} players, ${r.body.games} games, ${r.body.sockets} sockets`);
+    // typeof checks matter: these are the only COUNT(*)::bigint values in the
+    // API, so they are where a missing int8 type parser would surface — and
+    // `>= 2` is satisfied by the string "3" through numeric coercion.
+    ok(r.body.ok === true && typeof r.body.players === 'number' && typeof r.body.games === 'number'
+      && typeof r.body.sockets === 'number' && r.body.games >= 2,
+      `health: ${r.body.players} players, ${r.body.games} games, ${r.body.sockets} sockets (all numbers)`);
   } finally {
     srv.kill();
     await stopPostgres();
   }
 
+  // Floor check. CI greps this summary line, which already proves the run
+  // reached the end (a thrown suite never prints it) — but not that assertions
+  // still EXIST. Deleting tests would otherwise be silently green.
+  const MIN_ASSERTIONS = 72;
+  if (passed + failed < MIN_ASSERTIONS) {
+    console.log(`\nFAIL  only ${passed + failed} assertions ran, expected at least ${MIN_ASSERTIONS}`);
+    failed++;
+  }
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

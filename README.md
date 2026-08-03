@@ -5,12 +5,12 @@
 ### The online layer for arcade games — leaderboards, ghosts, live events, and realtime races
 
 [![CI](https://github.com/PandaCatz/PandaNet-Postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/PandaCatz/PandaNet-Postgres/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](test.js)
+[![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen.svg)](test.js)
 [![Postgres](https://img.shields.io/badge/postgres-%E2%89%A5%2013-336791.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-**Same API, same behaviour, same 65 tests — backed by PostgreSQL instead of SQLite.**
+**Same API, same behaviour, same 72 tests — backed by PostgreSQL instead of SQLite.**
 
 Sibling of [PandaCatz/PandaNet](https://github.com/PandaCatz/PandaNet) (the zero-dependency SQLite edition).
 
@@ -36,14 +36,14 @@ changed; only storage did.
 | Deploy target | VPS with persistent disk | VPS, or any PaaS with managed Postgres |
 | Concurrency | one writer | real concurrent writes |
 | Backups | `sqlite3 .backup` | `pg_dump` / provider snapshots |
-| API + tests | identical | identical (65 assertions) |
+| API + tests | identical | identical (72 assertions) |
 
 ## Quick start
 
 ```bash
 npm install
 DATABASE_URL=postgres://user:pass@localhost:5432/pandanet npm start
-npm test          # spins up a real PostgreSQL and runs all 65 assertions
+npm test          # spins up a real PostgreSQL and runs all 72 assertions
 ```
 
 `npm test` needs no database of its own — it downloads and runs a real
@@ -62,6 +62,7 @@ existing server to use that instead (which is what CI should do).
 | `SEED_KEY` | yes | HMAC key every daily seed derives from. Set once; changing it changes every seed. |
 | `PROXY_KEY` | platform mode | Shared secret for the platform proxy's `X-Proxy-Key`. |
 | `TRUST_PROXY` | `1` behind a proxy | Use the first `X-Forwarded-For` entry for rate limiting. |
+| `RATE_PER_MIN` | no (60) | Requests per minute per key. The key is the client IP, or — when a request authenticates with `PROXY_KEY` — the vouched player, since behind a proxy every request shares one address. Raise it if one proxy fronts many games. |
 
 Run `node server.js --migrate-only` to create or update the schema and exit —
 useful as a release/deploy step. It is idempotent.
@@ -95,7 +96,33 @@ five things needed real attention:
 `ON CONFLICT … DO UPDATE … WHERE` — the trickiest SQL in the project — ported
 unchanged; Postgres and SQLite share that syntax.
 
-## Deploy
+## Deploy to a hosting platform
+
+If your platform builds from the repo and provides managed Postgres (Nixpacks,
+Heroku-style buildpacks, Render, Railway, breezedeploy, …), there is nothing to
+install — it runs `npm start`. Set these and you are done:
+
+| | |
+|---|---|
+| `DATABASE_URL` | from the platform's managed database |
+| **`HOST=0.0.0.0`** | **required.** The default is loopback, which is right behind a local reverse proxy but makes the app **unreachable** when the router lives outside the container — a completely silent failure. The server prints a reminder at boot when it binds loopback. |
+| `PORT` | usually injected by the platform; honoured automatically |
+| `ADMIN_KEY`, `SEED_KEY` | generate your own; `SEED_KEY` must never change once live |
+| `PROXY_KEY` | only if a platform proxy will vouch for player identity |
+
+The schema is created and updated automatically on every boot, so no release
+or migration step is needed.
+
+Two requirements to check with your provider before committing:
+
+- **WebSocket upgrades must be proxied**, or multiplayer will not work.
+  Leaderboards, seeds, events and ghosts are unaffected.
+- **A single instance.** Rooms, tickets and countdowns are in memory (see
+  [Still single-node](#still-single-node)), so two replicas split players
+  across processes. An always-on, non-scaling single container is the right
+  shape; scale-to-zero would destroy live lobbies.
+
+## Deploy to your own VPS
 
 ```bash
 cd deploy && bash setup.sh api.yourdomain.tld
@@ -138,4 +165,4 @@ Unchanged — see the [SQLite edition's README](https://github.com/PandaCatz/Pan
 [AGENT_HANDOFF.md](https://github.com/PandaCatz/PandaNet/blob/main/AGENT_HANDOFF.md) and
 [INTEGRATION.md](https://github.com/PandaCatz/PandaNet/blob/main/INTEGRATION.md). Every endpoint, the WebSocket
 protocol, the client SDK contract, and the anti-cheat behaviour are identical,
-which is why the same 65-assertion suite passes against both.
+which is why the same 72-assertion suite passes against both.

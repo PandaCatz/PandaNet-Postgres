@@ -102,6 +102,25 @@ function coerceCfg(raw) {
   return cfg;
 }
 function gameCfg(game) { return cfgCache.get(game) || CFG_DEFAULT; }
+// Postgres rejects U+0000 in a text parameter (SQLSTATE 22021), so an id
+// carrying one turns a clean lookup miss into a 500 with a raw driver error in
+// the log — where SQLite simply found nothing. Every id this server mints is
+// hex and proxy ids already match this shape, so no legitimate value is
+// excluded. Applied to every id that reaches a query.
+const okId = s => typeof s === 'string' && /^[\w:-]{1,64}$/.test(s);
+
+// jsonb cannot represent U+0000 even as an escape, so a NUL anywhere in an
+// event payload fails the insert (22P05). Checked structurally rather than on
+// the serialized JSON: a legitimate six-character literal backslash-u-0-0-0-0
+// serializes to the same substring and would be corrupted by a text scrub.
+const NUL = String.fromCharCode(0);
+function hasNul(v) {
+  if (typeof v === 'string') return v.includes(NUL);
+  if (Array.isArray(v)) return v.some(hasNul);
+  if (v && typeof v === 'object') return Object.values(v).some(hasNul);
+  return false;
+}
+
 function cleanName(s) {
   // Printable ASCII only, and no HTML-special characters — boards get rendered
   // by many consumers and a name must never be able to smuggle markup.
@@ -149,7 +168,7 @@ async function auth(req, body, canonical) {
   const viaProxy = await proxyPlayer(req);
   if (viaProxy) return { player: viaProxy, proxied: true };
   if (PROXY_KEY && req.headers['x-proxy-key']) return { err: 'bad proxy key' };
-  const p = (body && typeof body.playerId === 'string') ? await db.playerGet(body.playerId) : null;
+  const p = okId(body?.playerId) ? await db.playerGet(body.playerId) : null;
   if (!p) return { err: 'unknown player' };
   const ts = +body.ts;
   if (!Number.isFinite(ts) || Math.abs(now() - ts) > SIG_WINDOW_MS) return { err: 'stale timestamp' };
@@ -158,18 +177,23 @@ async function auth(req, body, canonical) {
   return { player: p };
 }
 
-// Per-IP token bucket: 60 req/min. Small map, pruned on the hour.
+// Token bucket per key, refilling at RATE_PER_MIN/60 per second.
+// Configurable because the right ceiling depends on deployment: a single game
+// on a VPS wants the default, while a platform fronting many games behind one
+// proxy IP, or a test harness driving hundreds of requests from localhost,
+// needs it higher.
+const RATE_PER_MIN = Math.max(1, +(process.env.RATE_PER_MIN || 60));
 const buckets = new Map();
-function rateOk(ip) {
+function rateOk(key) {
   const t = now();
-  let b = buckets.get(ip);
+  let b = buckets.get(key);
   if (!b) {
     // Hard cap so an address-rotating client can't grow the map without bound
     // between hourly prunes. Clearing briefly resets limits; that beats OOM.
     if (buckets.size >= 50000) buckets.clear();
-    b = { tokens: 60, at: t }; buckets.set(ip, b);
+    b = { tokens: RATE_PER_MIN, at: t }; buckets.set(key, b);
   }
-  b.tokens = Math.min(60, b.tokens + (t - b.at) / 1000);
+  b.tokens = Math.min(RATE_PER_MIN, b.tokens + (t - b.at) * RATE_PER_MIN / 60000);
   b.at = t;
   if (b.tokens < 1) return false;
   b.tokens -= 1;
@@ -248,9 +272,9 @@ const routes = {
     // Refresh path: known identity proves itself with its secret. Any refresh
     // attempt with malformed credentials is a 403, never a fresh identity.
     if (body.playerId || body.secret) {
-      if (typeof body.playerId !== 'string' || typeof body.secret !== 'string')
+      if (!okId(body.playerId) || typeof body.secret !== 'string')
         return [403, { error: 'bad credentials' }];
-      const p = await db.playerGet(String(body.playerId));
+      const p = await db.playerGet(body.playerId);
       if (p && sigOk(p.secret, 'hello|' + p.id, hmac(body.secret, 'hello|' + p.id))) {
         await db.playerTouch(now(), p.id);
         if (body.name) { const nm = cleanName(body.name); await db.playerName(nm, p.id); p.name = nm; }
@@ -291,7 +315,8 @@ const routes = {
   'POST /api/run/finish': async (body, _url, req) => {
     const a = await auth(req, body, `finish|${body.runId}|${body.score}|${body.rooms}|${body.ts}`);
     if (a.err) return [403, { error: a.err }];
-    const run = await db.runGet(String(body.runId || ''));
+    if (!okId(body.runId)) return [404, { error: 'unknown run' }];
+    const run = await db.runGet(body.runId);
     if (!run || run.player !== a.player.id) return [404, { error: 'unknown run' }];
     if (run.status !== 'open') return [409, { error: 'run already finished' }];
     const cfg = gameCfg(run.game);
@@ -358,7 +383,7 @@ const routes = {
       }),
     };
     const around = url.searchParams.get('around');
-    if (around && scope !== 'alltime') {
+    if (okId(around) && scope !== 'alltime') {
       const mine = await db.scoreGet(game, day, around);
       if (mine) out.me = { rank: (await db.rankDaily(game, day, mine.score)).n + 1, score: mine.score, rooms: mine.rooms };
     }
@@ -410,6 +435,7 @@ const routes = {
     const game = gameId(body.game);
     if (!game) return [400, { error: 'bad game' }];
     if (!isDay(body.startDay) || !isDay(body.endDay)) return [400, { error: 'bad days' }];
+    if (hasNul(body.data)) return [400, { error: 'data contains a NUL character' }];
     await db.eventNew(game, body.startDay, body.endDay, body.data ?? {});
     return [200, { ok: true }];
   },
@@ -495,6 +521,13 @@ async function boot() {
   await new Promise(res => server.listen(PORT, HOST, res));
   const where = DATABASE_URL.replace(/\/\/[^@]*@/, '//***@');
   console.log(`pandanet listening on ${HOST}:${PORT} · db ${where} · proxy mode ${PROXY_KEY ? 'on' : 'off'}`);
+  // Loopback is the right default for a VPS behind Caddy, but on a PaaS the
+  // router lives outside this container and a loopback bind is unreachable —
+  // which presents as a totally silent failure. Say so at boot.
+  if (HOST === '127.0.0.1' && !process.env.HOST) {
+    console.log('note: bound to loopback only. On a hosting platform that routes ' +
+      'to this container from outside, set HOST=0.0.0.0 or nothing can reach it.');
+  }
 }
 
 // Shut down cleanly so in-flight queries finish and the pool is released;
