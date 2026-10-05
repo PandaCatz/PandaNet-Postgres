@@ -14,7 +14,7 @@
     "migrate": "node server.js --migrate-only"
   },
   "dependencies": {
-    "pg": "^8.13.1"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "embedded-postgres": "18.4.0-beta.17"
